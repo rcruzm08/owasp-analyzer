@@ -1,1310 +1,573 @@
-import os
-import re
-import html
-import hashlib
+import os, re, json, time, html, secrets, hashlib
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
-from datetime import datetime
-from flask import Flask, request, render_template_string, jsonify, redirect, url_for
+from typing import Any
 from dotenv import load_dotenv
+from flask import Flask, request, render_template_string, jsonify, redirect, url_for, flash, make_response
 import mysql.connector
-from mysql.connector import Error
 
 load_dotenv()
+APP_NAME = "OWASP Analyzer"
+DB_NAME = os.getenv("DB_NAME", "owasp_analyzer_db")
+SUPPORTED_LANGUAGES = {"php", "python", "java", "javascript"}
+MAX_SOURCE_SIZE = int(os.getenv("MAX_SOURCE_SIZE", "200000"))
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = hashlib.sha256(str(datetime.utcnow()).encode()).hexdigest()
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or secrets.token_hex(32)
 
-@dataclass
+@dataclass(frozen=True)
 class Finding:
     title: str
     severity: str
     category: str
-    owasp: str
+    owasp_2021: str
+    owasp_2025: str
     language: str
     line: int
     evidence: str
     impact: str
     recommendation: str
     confidence: str
+    cwe: str = "N/A"
 
 class Database:
     def __init__(self):
-        self.config = {
+        self.server_config = {
             "host": os.getenv("DB_HOST", "127.0.0.1"),
             "port": int(os.getenv("DB_PORT", "3306")),
             "user": os.getenv("DB_USER", "root"),
             "password": os.getenv("DB_PASSWORD", ""),
-            "database": os.getenv("DB_NAME", "owasp_analyzer_db"),
             "charset": "utf8mb4",
-            "autocommit": False
+            "autocommit": False,
         }
+        self.config = {**self.server_config, "database": DB_NAME}
+
+    def connect_server(self):
+        return mysql.connector.connect(**self.server_config)
 
     def connect(self):
         return mysql.connector.connect(**self.config)
 
-    def save_analysis(self, language, source_code, score, risk, findings):
-        conn = None
-        cursor = None
+    def initialize(self):
+        conn = self.connect_server()
+        cur = conn.cursor()
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        conn.commit(); cur.close(); conn.close()
 
+        conn = self.connect(); cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                language VARCHAR(30) NOT NULL,
+                source_code LONGTEXT NOT NULL,
+                source_hash CHAR(64) NULL,
+                risk VARCHAR(50) NOT NULL,
+                score INT NOT NULL,
+                total_findings INT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_analyses_created_at (created_at),
+                INDEX idx_analyses_language (language),
+                INDEX idx_analyses_risk (risk)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS findings (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                analysis_id INT NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                severity VARCHAR(30) NOT NULL,
+                category VARCHAR(120) NOT NULL,
+                owasp VARCHAR(120) NULL,
+                owasp_2021 VARCHAR(160) NULL,
+                owasp_2025 VARCHAR(160) NULL,
+                language VARCHAR(30) NOT NULL,
+                line_number INT NOT NULL,
+                evidence TEXT NOT NULL,
+                impact TEXT NOT NULL,
+                recommendation TEXT NOT NULL,
+                confidence VARCHAR(30) NOT NULL DEFAULT 'Medium',
+                cwe VARCHAR(30) DEFAULT 'N/A',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_findings_analysis_id (analysis_id),
+                INDEX idx_findings_severity (severity),
+                INDEX idx_findings_category (category),
+                INDEX idx_findings_cwe (cwe)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        for table, col, definition in [
+            ("analyses", "source_hash", "CHAR(64) NULL"),
+            ("findings", "owasp", "VARCHAR(120) NULL"),
+            ("findings", "owasp_2021", "VARCHAR(160) NULL"),
+            ("findings", "owasp_2025", "VARCHAR(160) NULL"),
+            ("findings", "confidence", "VARCHAR(30) NOT NULL DEFAULT 'Medium'"),
+            ("findings", "cwe", "VARCHAR(30) DEFAULT 'N/A'"),
+        ]:
+            self.ensure_column(cur, table, col, definition)
         try:
-            conn = self.connect()
-            cursor = conn.cursor()
+            cur.execute("ALTER TABLE findings ADD CONSTRAINT fk_findings_analysis FOREIGN KEY (analysis_id) REFERENCES analyses(id) ON DELETE CASCADE")
+        except Exception:
+            pass
+        conn.commit(); cur.close(); conn.close()
 
-            cursor.execute(
-                """
-                INSERT INTO analyses (language, source_code, risk, score, total_findings)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (language, source_code, risk, score, len(findings))
-            )
+    def ensure_column(self, cur, table, col, definition):
+        cur.execute("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND COLUMN_NAME=%s
+        """, (DB_NAME, table, col))
+        if cur.fetchone()[0] == 0:
+            cur.execute(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {definition}")
 
-            analysis_id = cursor.lastrowid
+    def ping(self):
+        try:
+            conn = self.connect(); conn.close()
+            return True, "Online"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
 
-            for finding in findings:
-                cursor.execute(
-                    """
-                    INSERT INTO findings
-                    (
-                        analysis_id,
-                        title,
-                        severity,
-                        category,
-                        owasp,
-                        language,
-                        line_number,
-                        evidence,
-                        impact,
-                        recommendation,
-                        confidence
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        analysis_id,
-                        finding.title,
-                        finding.severity,
-                        finding.category,
-                        finding.owasp,
-                        finding.language,
-                        finding.line,
-                        finding.evidence,
-                        finding.impact,
-                        finding.recommendation,
-                        finding.confidence
-                    )
-                )
+    def save_analysis(self, language, source_code, score, risk, findings):
+        conn = self.connect(); cur = conn.cursor()
+        source_hash = hashlib.sha256(source_code.encode("utf-8", errors="ignore")).hexdigest()
+        cur.execute("""
+            INSERT INTO analyses (language, source_code, source_hash, risk, score, total_findings)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (language, source_code, source_hash, risk, score, len(findings)))
+        analysis_id = cur.lastrowid
+        for f in findings:
+            cur.execute("""
+                INSERT INTO findings (
+                    analysis_id, title, severity, category, owasp, owasp_2021, owasp_2025,
+                    language, line_number, evidence, impact, recommendation, confidence, cwe
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                analysis_id, f.title, f.severity, f.category, f.owasp_2021, f.owasp_2021,
+                f.owasp_2025, f.language, f.line, f.evidence, f.impact, f.recommendation, f.confidence, f.cwe
+            ))
+        conn.commit(); cur.close(); conn.close()
+        return int(analysis_id)
 
-            conn.commit()
-            return analysis_id
-
-        except Error:
-            if conn:
-                conn.rollback()
-            raise
-
-        finally:
-            if cursor:
-                cursor.close()
-            if conn:
-                conn.close()
-
-    def get_history(self):
-        conn = self.connect()
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute(
-            """
-            SELECT id, language, risk, score, total_findings, created_at
-            FROM analyses
-            ORDER BY created_at DESC
-            LIMIT 50
-            """
-        )
-
-        rows = cursor.fetchall()
-
-        for row in rows:
-            row["created_at"] = str(row["created_at"])
-
-        cursor.close()
-        conn.close()
+    def get_history(self, q="", language="", risk="", limit=100):
+        clauses, params = [], []
+        if q:
+            clauses.append("(source_code LIKE %s OR source_hash LIKE %s)"); params += [f"%{q}%", f"%{q}%"]
+        if language:
+            clauses.append("language=%s"); params.append(language)
+        if risk:
+            clauses.append("risk=%s"); params.append(risk)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        conn = self.connect(); cur = conn.cursor(dictionary=True)
+        cur.execute(f"""
+            SELECT id, language, risk, score, total_findings, source_hash, created_at
+            FROM analyses {where} ORDER BY created_at DESC LIMIT %s
+        """, (*params, limit))
+        rows = cur.fetchall()
+        for r in rows: r["created_at"] = str(r["created_at"])
+        cur.close(); conn.close()
         return rows
 
     def get_analysis(self, analysis_id):
-        conn = self.connect()
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute(
-            """
-            SELECT id, language, source_code, risk, score, total_findings, created_at
-            FROM analyses
-            WHERE id = %s
-            """,
-            (analysis_id,)
-        )
-
-        analysis = cursor.fetchone()
-
+        conn = self.connect(); cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM analyses WHERE id=%s", (analysis_id,))
+        analysis = cur.fetchone()
+        findings = []
         if analysis:
             analysis["created_at"] = str(analysis["created_at"])
-
-        cursor.execute(
-            """
-            SELECT id, title, severity, category, owasp, language, line_number, evidence, impact, recommendation, confidence, created_at
-            FROM findings
-            WHERE analysis_id = %s
-            ORDER BY
-                CASE severity
-                    WHEN 'Critical' THEN 1
-                    WHEN 'High' THEN 2
-                    WHEN 'Medium' THEN 3
-                    WHEN 'Low' THEN 4
-                    ELSE 5
-                END,
-                line_number ASC
-            """,
-            (analysis_id,)
-        )
-
-        findings = cursor.fetchall()
-
-        for finding in findings:
-            finding["created_at"] = str(finding["created_at"])
-
-        cursor.close()
-        conn.close()
+            cur.execute("""
+                SELECT id,title,severity,category,COALESCE(owasp_2021,owasp,'N/A') AS owasp_2021,
+                       COALESCE(owasp_2025,'N/A') AS owasp_2025,language,line_number,evidence,impact,
+                       recommendation,confidence,cwe,created_at
+                FROM findings WHERE analysis_id=%s
+                ORDER BY CASE severity WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 WHEN 'Low' THEN 4 ELSE 5 END, line_number ASC
+            """, (analysis_id,))
+            findings = cur.fetchall()
+            for f in findings: f["created_at"] = str(f["created_at"])
+        cur.close(); conn.close()
         return analysis, findings
 
+    def get_recent_source(self, analysis_id):
+        conn = self.connect(); cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT language, source_code FROM analyses WHERE id=%s", (analysis_id,))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return (row["language"], row["source_code"]) if row else None
+
     def delete_analysis(self, analysis_id):
-        conn = self.connect()
-        cursor = conn.cursor()
+        conn = self.connect(); cur = conn.cursor()
+        cur.execute("DELETE FROM analyses WHERE id=%s", (analysis_id,))
+        conn.commit(); cur.close(); conn.close()
 
-        cursor.execute(
-            """
-            DELETE FROM analyses
-            WHERE id = %s
-            """,
-            (analysis_id,)
-        )
+    def clear_history(self):
+        conn = self.connect(); cur = conn.cursor()
+        cur.execute("DELETE FROM analyses")
+        conn.commit(); cur.close(); conn.close()
 
-        conn.commit()
-        cursor.close()
-        conn.close()
+    def stats(self):
+        conn = self.connect(); cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT COUNT(*) total FROM analyses"); total_analyses = cur.fetchone()["total"]
+        cur.execute("SELECT COUNT(*) total FROM findings"); total_findings = cur.fetchone()["total"]
+        cur.execute("SELECT severity, COUNT(*) total FROM findings GROUP BY severity")
+        sev = {r["severity"]: r["total"] for r in cur.fetchall()}
+        cur.execute("SELECT language, COUNT(*) total FROM analyses GROUP BY language ORDER BY total DESC")
+        languages = cur.fetchall()
+        cur.execute("SELECT category, COUNT(*) total FROM findings GROUP BY category ORDER BY total DESC LIMIT 8")
+        categories = cur.fetchall()
+        cur.close(); conn.close()
+        return {
+            "total_analyses": total_analyses,
+            "total_findings": total_findings,
+            "critical": sev.get("Critical", 0),
+            "high": sev.get("High", 0),
+            "medium": sev.get("Medium", 0),
+            "low": sev.get("Low", 0),
+            "languages": languages,
+            "categories": categories,
+        }
 
 class SecurityAnalyzer:
     def __init__(self):
+        impact = {
+            "sqli": "Pode permitir leitura, alteração ou remoção de dados e bypass de autenticação.",
+            "xss": "Pode permitir execução de JavaScript no navegador, roubo de sessão ou alteração da página.",
+            "cmd": "Pode permitir execução de comandos no sistema operacional com privilégios da aplicação.",
+            "code": "Pode permitir execução de código arbitrário dentro do processo da aplicação.",
+            "path": "Pode permitir leitura de arquivos sensíveis ou acesso fora do diretório permitido.",
+            "deser": "Pode permitir manipulação de objetos, execução de código ou bypass de regras internas.",
+            "crypto": "Pode expor dados sensíveis ou facilitar quebra de senhas, tokens e assinaturas.",
+            "secret": "Pode expor credenciais em repositórios, logs, backups ou entregas ao cliente.",
+            "auth": "Pode permitir bypass de autenticação, sessão fraca ou elevação de privilégio.",
+            "misconfig": "Pode expor debug, stack traces ou comportamento inseguro.",
+            "upload": "Pode permitir upload de arquivos indevidos ou execução posterior de conteúdo malicioso.",
+            "ssrf": "Pode permitir que o servidor acesse recursos internos ou externos sem autorização.",
+        }
         self.rules = {
             "php": [
-                {
-                    "title": "SQL Injection por concatenação",
-                    "severity": "Critical",
-                    "category": "Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"(SELECT|INSERT|UPDATE|DELETE).*(\.\s*\$_(GET|POST|REQUEST|COOKIE)|\{?\$_(GET|POST|REQUEST|COOKIE))",
-                        r"mysqli_query\s*\([^,]+,\s*[^)]*\$_(GET|POST|REQUEST|COOKIE)",
-                        r"mysql_query\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)"
-                    ],
-                    "impact": "Permite manipular consultas SQL, acessar dados não autorizados, alterar registros ou autenticar indevidamente.",
-                    "recommendation": "Use prepared statements com bind de parâmetros e validação de tipo.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "XSS refletido ou armazenado",
-                    "severity": "High",
-                    "category": "Cross-Site Scripting",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"echo\s+\$_(GET|POST|REQUEST|COOKIE)",
-                        r"print\s+\$_(GET|POST|REQUEST|COOKIE)",
-                        r"<\?=\s*\$_(GET|POST|REQUEST|COOKIE)"
-                    ],
-                    "impact": "Permite executar JavaScript no navegador da vítima, roubar sessões ou alterar conteúdo da página.",
-                    "recommendation": "Use htmlspecialchars com ENT_QUOTES e UTF-8 antes de exibir dados do usuário.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Command Injection",
-                    "severity": "Critical",
-                    "category": "Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"(system|exec|shell_exec|passthru|popen|proc_open)\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)"
-                    ],
-                    "impact": "Permite executar comandos no sistema operacional com privilégios da aplicação.",
-                    "recommendation": "Evite shell. Use APIs seguras, allowlist estrita e escapes específicos quando inevitável.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Path Traversal ou LFI",
-                    "severity": "High",
-                    "category": "File Inclusion",
-                    "owasp": "A01:2021 Broken Access Control",
-                    "patterns": [
-                        r"(include|require|include_once|require_once)\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)",
-                        r"(readfile|file_get_contents|fopen)\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)"
-                    ],
-                    "impact": "Permite ler arquivos sensíveis ou incluir arquivos indevidos no servidor.",
-                    "recommendation": "Use allowlist de arquivos válidos, normalize caminhos e bloqueie ../ e caminhos absolutos.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Desserialização insegura",
-                    "severity": "Critical",
-                    "category": "Insecure Deserialization",
-                    "owasp": "A08:2021 Software and Data Integrity Failures",
-                    "patterns": [
-                        r"unserialize\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)"
-                    ],
-                    "impact": "Pode permitir execução de código, manipulação de objetos ou bypass de lógica.",
-                    "recommendation": "Não desserialize dados controlados pelo usuário. Use JSON e validação de esquema.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Hash inseguro para senha ou token",
-                    "severity": "Medium",
-                    "category": "Cryptographic Failure",
-                    "owasp": "A02:2021 Cryptographic Failures",
-                    "patterns": [
-                        r"\b(md5|sha1)\s*\("
-                    ],
-                    "impact": "Hashes fracos podem ser quebrados por força bruta ou rainbow tables.",
-                    "recommendation": "Use password_hash com PASSWORD_BCRYPT ou PASSWORD_ARGON2ID.",
-                    "confidence": "Medium"
-                },
-                {
-                    "title": "Upload de arquivo inseguro",
-                    "severity": "High",
-                    "category": "Unrestricted File Upload",
-                    "owasp": "A05:2021 Security Misconfiguration",
-                    "patterns": [
-                        r"move_uploaded_file\s*\([^)]*\$_FILES",
-                        r"\$_FILES\s*\[[^\]]+\]\s*\[\s*['\"]name['\"]\s*\]"
-                    ],
-                    "impact": "Pode permitir upload de arquivos executáveis, webshells ou sobrescrita de arquivos.",
-                    "recommendation": "Valide MIME real, extensão, tamanho, renomeie arquivos e armazene fora da raiz pública.",
-                    "confidence": "Medium"
-                }
+                self.rule("SQL Injection por concatenação","Critical","Injection","A03:2021 Injection","A05:2025 Injection","CWE-89",[r"(SELECT|INSERT|UPDATE|DELETE).*(\.\s*\$_(GET|POST|REQUEST|COOKIE)|\$_(GET|POST|REQUEST|COOKIE))",r"(mysqli_query|mysql_query|pg_query)\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)"],impact["sqli"],"Use prepared statements com bind de parâmetros."),
+                self.rule("XSS refletido ou armazenado","High","Cross-Site Scripting","A03:2021 Injection","A05:2025 Injection","CWE-79",[r"\b(echo|print)\s+\$_(GET|POST|REQUEST|COOKIE)",r"<\?=\s*\$_(GET|POST|REQUEST|COOKIE)"],impact["xss"],"Use htmlspecialchars com ENT_QUOTES e UTF-8."),
+                self.rule("Command Injection","Critical","Injection","A03:2021 Injection","A05:2025 Injection","CWE-78",[r"\b(system|exec|shell_exec|passthru|popen|proc_open)\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)"],impact["cmd"],"Evite shell; use APIs nativas e allowlist."),
+                self.rule("Path Traversal ou LFI","High","Broken Access Control","A01:2021 Broken Access Control","A01:2025 Broken Access Control","CWE-22",[r"\b(include|require|file_get_contents|fopen|readfile)\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)"],impact["path"],"Use allowlist e normalize caminhos."),
+                self.rule("Desserialização insegura","Critical","Software and Data Integrity Failures","A08:2021 Software and Data Integrity Failures","A03:2025 Software Supply Chain Failures","CWE-502",[r"\bunserialize\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)"],impact["deser"],"Não desserialize dados externos."),
+                self.rule("Hash inseguro","Medium","Cryptographic Failures","A02:2021 Cryptographic Failures","A04:2025 Cryptographic Failures","CWE-327",[r"\b(md5|sha1)\s*\("],impact["crypto"],"Use password_hash com Argon2id ou bcrypt."),
+                self.rule("Upload inseguro","High","Unrestricted File Upload","A05:2021 Security Misconfiguration","A02:2025 Security Misconfiguration","CWE-434",[r"\bmove_uploaded_file\s*\([^)]*\$_FILES",r"\$_FILES\s*\[[^\]]+\]\s*\[\s*['\"]name['\"]"],impact["upload"],"Valide MIME real, extensão e renomeie arquivos."),
             ],
             "python": [
-                {
-                    "title": "SQL Injection por interpolação",
-                    "severity": "Critical",
-                    "category": "Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"execute\s*\(\s*f[\"'].*(SELECT|INSERT|UPDATE|DELETE)",
-                        r"execute\s*\(\s*[\"'].*(SELECT|INSERT|UPDATE|DELETE).*(\+|%)",
-                        r"(SELECT|INSERT|UPDATE|DELETE).*\{.*\}",
-                        r"(SELECT|INSERT|UPDATE|DELETE).*%s"
-                    ],
-                    "impact": "Permite manipular consultas SQL e acessar ou alterar dados indevidamente.",
-                    "recommendation": "Use queries parametrizadas do driver do banco de dados.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Command Injection",
-                    "severity": "Critical",
-                    "category": "Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"os\.system\s*\(",
-                        r"subprocess\.(call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*True",
-                        r"commands\.getoutput\s*\("
-                    ],
-                    "impact": "Permite execução de comandos no sistema operacional.",
-                    "recommendation": "Use subprocess com lista de argumentos, shell=False e validação por allowlist.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Execução dinâmica perigosa",
-                    "severity": "Critical",
-                    "category": "Code Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"\beval\s*\(",
-                        r"\bexec\s*\("
-                    ],
-                    "impact": "Permite executar código arbitrário caso a entrada seja controlada pelo usuário.",
-                    "recommendation": "Remova eval/exec. Use parsers seguros, estruturas condicionais ou mapeamento de funções permitidas.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Desserialização insegura",
-                    "severity": "Critical",
-                    "category": "Insecure Deserialization",
-                    "owasp": "A08:2021 Software and Data Integrity Failures",
-                    "patterns": [
-                        r"pickle\.loads\s*\(",
-                        r"pickle\.load\s*\(",
-                        r"yaml\.load\s*\("
-                    ],
-                    "impact": "Pode permitir execução de código ou criação de objetos maliciosos.",
-                    "recommendation": "Evite pickle com dados externos. Use json e yaml.safe_load quando aplicável.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Path Traversal",
-                    "severity": "High",
-                    "category": "Broken Access Control",
-                    "owasp": "A01:2021 Broken Access Control",
-                    "patterns": [
-                        r"open\s*\([^)]*(request\.args|request\.form|input\s*\()",
-                        r"send_file\s*\([^)]*(request\.args|request\.form)",
-                        r"send_from_directory\s*\([^)]*(request\.args|request\.form)"
-                    ],
-                    "impact": "Permite leitura ou exposição de arquivos fora do diretório esperado.",
-                    "recommendation": "Normalize caminhos, use allowlist e bloqueie diretórios superiores.",
-                    "confidence": "Medium"
-                },
-                {
-                    "title": "Hash inseguro",
-                    "severity": "Medium",
-                    "category": "Cryptographic Failure",
-                    "owasp": "A02:2021 Cryptographic Failures",
-                    "patterns": [
-                        r"hashlib\.(md5|sha1)\s*\("
-                    ],
-                    "impact": "Pode facilitar quebra de senhas ou tokens.",
-                    "recommendation": "Use bcrypt, argon2 ou PBKDF2 com salt e custo adequado.",
-                    "confidence": "Medium"
-                },
-                {
-                    "title": "Debug habilitado",
-                    "severity": "Medium",
-                    "category": "Security Misconfiguration",
-                    "owasp": "A05:2021 Security Misconfiguration",
-                    "patterns": [
-                        r"debug\s*=\s*True",
-                        r"app\.run\s*\([^)]*debug\s*=\s*True"
-                    ],
-                    "impact": "Pode expor stack traces, variáveis internas e console interativo.",
-                    "recommendation": "Desative debug em produção e use logs controlados.",
-                    "confidence": "High"
-                }
+                self.rule("SQL Injection por interpolação","Critical","Injection","A03:2021 Injection","A05:2025 Injection","CWE-89",[r"\.execute\s*\(\s*f[\"'].*(SELECT|INSERT|UPDATE|DELETE)",r"\.execute\s*\(\s*[\"'].*(SELECT|INSERT|UPDATE|DELETE).*(\+|%)",r"\.execute\s*\([^)]*\.format\s*\("],impact["sqli"],"Use cursor.execute com parâmetros."),
+                self.rule("Command Injection","Critical","Injection","A03:2021 Injection","A05:2025 Injection","CWE-78",[r"\bos\.system\s*\(",r"subprocess\.(call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*True"],impact["cmd"],"Use subprocess com lista de argumentos e shell=False."),
+                self.rule("Execução dinâmica perigosa","Critical","Code Injection","A03:2021 Injection","A05:2025 Injection","CWE-94",[r"\beval\s*\(",r"\bexec\s*\("],impact["code"],"Remova eval/exec e use lógica explícita."),
+                self.rule("Desserialização insegura","Critical","Software and Data Integrity Failures","A08:2021 Software and Data Integrity Failures","A03:2025 Software Supply Chain Failures","CWE-502",[r"\bpickle\.(loads|load)\s*\(",r"\byaml\.load\s*\("],impact["deser"],"Use JSON ou yaml.safe_load."),
+                self.rule("Path Traversal","High","Broken Access Control","A01:2021 Broken Access Control","A01:2025 Broken Access Control","CWE-22",[r"\bopen\s*\([^)]*(request\.args|request\.form|input\s*\()",r"\bsend_file\s*\([^)]*(request\.args|request\.form)"],impact["path"],"Normalize com pathlib e valide diretório base."),
+                self.rule("Hash inseguro","Medium","Cryptographic Failures","A02:2021 Cryptographic Failures","A04:2025 Cryptographic Failures","CWE-327",[r"\bhashlib\.(md5|sha1)\s*\("],impact["crypto"],"Use Argon2, bcrypt ou PBKDF2 com salt."),
+                self.rule("Debug habilitado","Medium","Security Misconfiguration","A05:2021 Security Misconfiguration","A02:2025 Security Misconfiguration","CWE-489",[r"\bdebug\s*=\s*True",r"\bapp\.run\s*\([^)]*debug\s*=\s*True"],impact["misconfig"],"Desative debug em produção."),
+                self.rule("SSRF potencial","High","Server-Side Request Forgery","A10:2021 SSRF","A10:2025 Server-Side Request Forgery","CWE-918",[r"\brequests\.(get|post|put|delete)\s*\([^)]*(request\.args|request\.form|input\s*\()"],impact["ssrf"],"Use allowlist de domínios e bloqueie IPs privados."),
             ],
             "java": [
-                {
-                    "title": "SQL Injection com Statement",
-                    "severity": "Critical",
-                    "category": "Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"createStatement\s*\(",
-                        r"execute(Query|Update)?\s*\([^)]*\+",
-                        r"(SELECT|INSERT|UPDATE|DELETE).*\+"
-                    ],
-                    "impact": "Permite manipular consultas SQL e comprometer dados.",
-                    "recommendation": "Use PreparedStatement com parâmetros tipados.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Command Injection",
-                    "severity": "Critical",
-                    "category": "Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"Runtime\.getRuntime\(\)\.exec\s*\(",
-                        r"new\s+ProcessBuilder\s*\([^)]*getParameter"
-                    ],
-                    "impact": "Permite executar comandos no sistema operacional.",
-                    "recommendation": "Evite execução de comandos. Use ProcessBuilder com argumentos fixos e allowlist.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Desserialização insegura",
-                    "severity": "Critical",
-                    "category": "Insecure Deserialization",
-                    "owasp": "A08:2021 Software and Data Integrity Failures",
-                    "patterns": [
-                        r"ObjectInputStream",
-                        r"readObject\s*\("
-                    ],
-                    "impact": "Pode permitir execução de código ou manipulação de objetos.",
-                    "recommendation": "Evite desserialização nativa com dados externos. Use filtros de classe e formatos seguros.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Path Traversal",
-                    "severity": "High",
-                    "category": "Broken Access Control",
-                    "owasp": "A01:2021 Broken Access Control",
-                    "patterns": [
-                        r"new\s+File\s*\([^)]*getParameter",
-                        r"Paths\.get\s*\([^)]*getParameter"
-                    ],
-                    "impact": "Permite acessar arquivos fora do caminho permitido.",
-                    "recommendation": "Normalize o caminho, valide base directory e use allowlist.",
-                    "confidence": "Medium"
-                },
-                {
-                    "title": "Hash inseguro",
-                    "severity": "Medium",
-                    "category": "Cryptographic Failure",
-                    "owasp": "A02:2021 Cryptographic Failures",
-                    "patterns": [
-                        r"MessageDigest\.getInstance\s*\(\s*[\"'](MD5|SHA-1)[\"']\s*\)"
-                    ],
-                    "impact": "Algoritmos fracos podem ser quebrados com baixo custo.",
-                    "recommendation": "Use BCrypt, Argon2 ou PBKDF2 para senhas.",
-                    "confidence": "High"
-                }
+                self.rule("SQL Injection com Statement","Critical","Injection","A03:2021 Injection","A05:2025 Injection","CWE-89",[r"\bcreateStatement\s*\(",r"\bexecute(Query|Update)?\s*\([^)]*\+",r"(SELECT|INSERT|UPDATE|DELETE).*\+"],impact["sqli"],"Use PreparedStatement."),
+                self.rule("Command Injection","Critical","Injection","A03:2021 Injection","A05:2025 Injection","CWE-78",[r"Runtime\.getRuntime\(\)\.exec\s*\(",r"new\s+ProcessBuilder\s*\([^)]*getParameter"],impact["cmd"],"Use argumentos fixos e allowlist."),
+                self.rule("Desserialização insegura","Critical","Software and Data Integrity Failures","A08:2021 Software and Data Integrity Failures","A03:2025 Software Supply Chain Failures","CWE-502",[r"\bObjectInputStream\b",r"\breadObject\s*\("],impact["deser"],"Evite desserialização nativa de dados externos."),
+                self.rule("Path Traversal","High","Broken Access Control","A01:2021 Broken Access Control","A01:2025 Broken Access Control","CWE-22",[r"new\s+File\s*\([^)]*getParameter",r"Paths\.get\s*\([^)]*getParameter"],impact["path"],"Normalize caminho e valide diretório base."),
+                self.rule("Hash inseguro","Medium","Cryptographic Failures","A02:2021 Cryptographic Failures","A04:2025 Cryptographic Failures","CWE-327",[r"MessageDigest\.getInstance\s*\(\s*[\"'](MD5|SHA-1)[\"']\s*\)"],impact["crypto"],"Use BCrypt, Argon2 ou PBKDF2."),
+                self.rule("XXE possível","High","Security Misconfiguration","A05:2021 Security Misconfiguration","A02:2025 Security Misconfiguration","CWE-611",[r"DocumentBuilderFactory\.newInstance\s*\(",r"SAXParserFactory\.newInstance\s*\("],"Pode permitir leitura de arquivos locais ou SSRF via XML.","Desabilite entidades externas e DTD."),
             ],
             "javascript": [
-                {
-                    "title": "XSS por innerHTML",
-                    "severity": "High",
-                    "category": "Cross-Site Scripting",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"\.innerHTML\s*=",
-                        r"document\.write\s*\(",
-                        r"\.insertAdjacentHTML\s*\("
-                    ],
-                    "impact": "Permite execução de JavaScript no navegador da vítima.",
-                    "recommendation": "Use textContent, sanitização confiável e templates com escaping.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "SQL Injection em Node.js",
-                    "severity": "Critical",
-                    "category": "Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"(SELECT|INSERT|UPDATE|DELETE).*(\$\{|req\.query|req\.body|\+)",
-                        r"query\s*\([^)]*(req\.query|req\.body|\+)"
-                    ],
-                    "impact": "Permite manipular consultas SQL e acessar ou alterar dados.",
-                    "recommendation": "Use queries parametrizadas e validação de entrada.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Command Injection",
-                    "severity": "Critical",
-                    "category": "Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"child_process\.exec\s*\(",
-                        r"\bexec\s*\([^)]*(req\.query|req\.body|\+)",
-                        r"\bspawn\s*\([^)]*(req\.query|req\.body)"
-                    ],
-                    "impact": "Permite execução de comandos no sistema operacional.",
-                    "recommendation": "Use execFile/spawn com argumentos fixos e validação por allowlist.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Uso perigoso de eval",
-                    "severity": "Critical",
-                    "category": "Code Injection",
-                    "owasp": "A03:2021 Injection",
-                    "patterns": [
-                        r"\beval\s*\(",
-                        r"new\s+Function\s*\("
-                    ],
-                    "impact": "Permite execução de código arbitrário.",
-                    "recommendation": "Remova eval/new Function e substitua por lógica explícita.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "JWT inseguro",
-                    "severity": "High",
-                    "category": "Identification and Authentication Failures",
-                    "owasp": "A07:2021 Identification and Authentication Failures",
-                    "patterns": [
-                        r"jwt\.decode\s*\(",
-                        r"jwt\.verify\s*\([^,]+,\s*[\"'](secret|123|password|admin)[\"']",
-                        r"jsonwebtoken\.decode\s*\("
-                    ],
-                    "impact": "Pode permitir bypass de autenticação ou uso de tokens adulterados.",
-                    "recommendation": "Use jwt.verify, segredo forte via variável de ambiente, algoritmo fixo e expiração.",
-                    "confidence": "High"
-                },
-                {
-                    "title": "Hardcoded Secret",
-                    "severity": "High",
-                    "category": "Cryptographic Failure",
-                    "owasp": "A02:2021 Cryptographic Failures",
-                    "patterns": [
-                        r"(secret|apiKey|apikey|token|password)\s*=\s*[\"'][^\"']{6,}[\"']",
-                        r"(SECRET|API_KEY|TOKEN|PASSWORD)\s*:\s*[\"'][^\"']{6,}[\"']"
-                    ],
-                    "impact": "Credenciais expostas podem ser usadas para acesso indevido a sistemas externos.",
-                    "recommendation": "Use variáveis de ambiente e cofres de segredo.",
-                    "confidence": "Medium"
-                }
-            ]
+                self.rule("XSS por HTML dinâmico","High","Cross-Site Scripting","A03:2021 Injection","A05:2025 Injection","CWE-79",[r"\.innerHTML\s*=",r"\bdocument\.write\s*\(",r"\.insertAdjacentHTML\s*\(",r"dangerouslySetInnerHTML"],impact["xss"],"Use textContent ou sanitização confiável."),
+                self.rule("SQL Injection em Node.js","Critical","Injection","A03:2021 Injection","A05:2025 Injection","CWE-89",[r"(SELECT|INSERT|UPDATE|DELETE).*(\$\{|req\.query|req\.body|\+)",r"\bquery\s*\([^)]*(req\.query|req\.body|\+)"],impact["sqli"],"Use queries parametrizadas."),
+                self.rule("Command Injection","Critical","Injection","A03:2021 Injection","A05:2025 Injection","CWE-78",[r"child_process\.exec\s*\(",r"\bexec\s*\([^)]*(req\.query|req\.body|\+)",r"\bspawn\s*\([^)]*(req\.query|req\.body)"],impact["cmd"],"Use execFile/spawn com argumentos fixos."),
+                self.rule("Uso perigoso de eval","Critical","Code Injection","A03:2021 Injection","A05:2025 Injection","CWE-94",[r"\beval\s*\(",r"new\s+Function\s*\("],impact["code"],"Remova eval/new Function."),
+                self.rule("JWT inseguro","High","Authentication Failures","A07:2021 Identification and Authentication Failures","A07:2025 Authentication Failures","CWE-347",[r"\bjwt\.decode\s*\(",r"jsonwebtoken\.decode\s*\(",r"jwt\.verify\s*\([^,]+,\s*[\"'](secret|123|password|admin)[\"']"],impact["auth"],"Use jwt.verify, segredo forte e algoritmo fixo."),
+                self.rule("Hardcoded Secret","High","Cryptographic Failures","A02:2021 Cryptographic Failures","A04:2025 Cryptographic Failures","CWE-798",[r"(secret|apiKey|apikey|token|password)\s*=\s*[\"'][^\"']{6,}[\"']",r"(SECRET|API_KEY|TOKEN|PASSWORD)\s*:\s*[\"'][^\"']{6,}[\"']"],impact["secret"],"Use variáveis de ambiente."),
+                self.rule("SSRF potencial","High","Server-Side Request Forgery","A10:2021 SSRF","A10:2025 Server-Side Request Forgery","CWE-918",[r"\b(fetch|axios\.get|axios\.post|request)\s*\([^)]*(req\.query|req\.body)"],impact["ssrf"],"Use allowlist de URLs e bloqueie redes internas."),
+            ],
         }
-
         self.generic_rules = [
-            {
-                "title": "Possível segredo hardcoded",
-                "severity": "High",
-                "category": "Sensitive Data Exposure",
-                "owasp": "A02:2021 Cryptographic Failures",
-                "patterns": [
-                    r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\s*[:=]\s*[\"'][^\"']{8,}[\"']",
-                    r"(?i)(aws_access_key_id|aws_secret_access_key)\s*[:=]\s*[\"'][^\"']+[\"']"
-                ],
-                "impact": "Segredos no código podem vazar por repositórios, logs ou backups.",
-                "recommendation": "Remova segredos do código e use variáveis de ambiente ou secret manager.",
-                "confidence": "Medium"
-            },
-            {
-                "title": "Comparação fraca de autenticação",
-                "severity": "Medium",
-                "category": "Authentication Weakness",
-                "owasp": "A07:2021 Identification and Authentication Failures",
-                "patterns": [
-                    r"(?i)(user|username|login).*(==|===).*[\"']admin[\"']",
-                    r"(?i)(password|senha).*(==|===).*[\"'][^\"']+[\"']"
-                ],
-                "impact": "Credenciais fixas ou comparações simples podem permitir bypass ou exposição de autenticação.",
-                "recommendation": "Use autenticação centralizada, hash seguro de senha e controle de sessão.",
-                "confidence": "Medium"
-            }
+            self.rule("Possível segredo hardcoded","High","Sensitive Data Exposure","A02:2021 Cryptographic Failures","A04:2025 Cryptographic Failures","CWE-798",[r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\s*[:=]\s*[\"'][^\"']{8,}[\"']"],"Segredos no código podem vazar por repositórios.","Use variáveis de ambiente ou secret manager."),
+            self.rule("Comparação fraca de autenticação","Medium","Authentication Weakness","A07:2021 Identification and Authentication Failures","A07:2025 Authentication Failures","CWE-287",[r"(?i)(user|username|login).*(==|===).*[\"']admin[\"']",r"(?i)(password|senha).*(==|===).*[\"'][^\"']+[\"']"],"Credenciais fixas podem permitir bypass.","Use autenticação centralizada e hash seguro."),
+            self.rule("Comentário com TODO/FIXME de segurança","Low","Security Hygiene","A05:2021 Security Misconfiguration","A02:2025 Security Misconfiguration","CWE-546",[r"(?i)(TODO|FIXME|HACK).*(security|auth|password|token|sql|sanitize|escape)"],"Dívidas técnicas podem permanecer em produção.","Transforme em tarefa e corrija antes do deploy."),
         ]
 
+    @staticmethod
+    def rule(title, severity, category, owasp_2021, owasp_2025, cwe, patterns, impact, recommendation, confidence="High"):
+        return dict(title=title, severity=severity, category=category, owasp_2021=owasp_2021, owasp_2025=owasp_2025, cwe=cwe, patterns=patterns, impact=impact, recommendation=recommendation, confidence=confidence)
+
     def analyze(self, source_code, language):
+        language = normalize_language(language)
         findings = []
-        lines = source_code.splitlines()
-        active_rules = self.rules.get(language, []) + self.generic_rules
-
-        for index, line in enumerate(lines, start=1):
-            stripped = line.strip()
-
-            if not stripped:
+        for i, line in enumerate(source_code.splitlines(), 1):
+            text = line.strip()
+            if not text or (text.startswith(("//", "#", "*")) and not re.search(r"TODO|FIXME|HACK", text, re.I)):
                 continue
-
-            for rule in active_rules:
+            for rule in self.rules.get(language, []) + self.generic_rules:
                 for pattern in rule["patterns"]:
-                    if re.search(pattern, stripped, re.IGNORECASE):
-                        findings.append(
-                            Finding(
-                                title=rule["title"],
-                                severity=rule["severity"],
-                                category=rule["category"],
-                                owasp=rule["owasp"],
-                                language=language,
-                                line=index,
-                                evidence=stripped[:250],
-                                impact=rule["impact"],
-                                recommendation=rule["recommendation"],
-                                confidence=rule["confidence"]
-                            )
-                        )
+                    if re.search(pattern, text, re.I):
+                        findings.append(Finding(rule["title"], rule["severity"], rule["category"], rule["owasp_2021"], rule["owasp_2025"], language, i, text[:300], rule["impact"], rule["recommendation"], rule["confidence"], rule["cwe"]))
                         break
+        return self.deduplicate(findings)
 
-        return self.reduce_duplicates(findings)
-
-    def reduce_duplicates(self, findings):
-        seen = set()
-        clean = []
-
-        for finding in findings:
-            key = (finding.title, finding.line, finding.evidence)
-
+    @staticmethod
+    def deduplicate(findings):
+        seen, clean = set(), []
+        order = {"Critical": 1, "High": 2, "Medium": 3, "Low": 4}
+        for f in sorted(findings, key=lambda x: (order.get(x.severity, 9), x.line, x.title)):
+            key = (f.title, f.line, f.evidence)
             if key not in seen:
-                seen.add(key)
-                clean.append(finding)
-
+                seen.add(key); clean.append(f)
         return clean
 
-    def score(self, findings):
-        weights = {
-            "Critical": 30,
-            "High": 20,
-            "Medium": 10,
-            "Low": 5
-        }
+    @staticmethod
+    def score(findings):
+        weights = {"Critical": 30, "High": 20, "Medium": 10, "Low": 4}
+        value = sum(weights.get(f.severity, 0) for f in findings) + min(len({f.category for f in findings}) * 3, 12)
+        score = min(value, 100)
+        if score >= 85: return score, "Crítico"
+        if score >= 60: return score, "Alto"
+        if score >= 30: return score, "Médio"
+        if score > 0: return score, "Baixo"
+        return score, "Sem achados relevantes"
 
-        total = sum(weights.get(f.severity, 0) for f in findings)
+def normalize_language(language):
+    value = (language or "python").strip().lower()
+    value = {"js": "javascript", "node": "javascript", "nodejs": "javascript", "py": "python"}.get(value, value)
+    return value if value in SUPPORTED_LANGUAGES else "python"
 
-        if total >= 90:
-            risk = "Crítico"
-        elif total >= 60:
-            risk = "Alto"
-        elif total >= 30:
-            risk = "Médio"
-        elif total > 0:
-            risk = "Baixo"
-        else:
-            risk = "Sem achados relevantes"
+def validate_source(source_code):
+    if not isinstance(source_code, str): return False, "source_code deve ser texto."
+    if not source_code.strip(): return False, "Cole algum código antes de analisar."
+    if len(source_code.encode("utf-8", errors="ignore")) > MAX_SOURCE_SIZE: return False, f"Código excede {MAX_SOURCE_SIZE} bytes."
+    return True, ""
 
-        return min(total, 100), risk
+def serialize_findings(findings, escape_evidence=False):
+    result = []
+    for f in findings:
+        item = asdict(f)
+        if escape_evidence: item["evidence"] = html.escape(item["evidence"])
+        result.append(item)
+    return result
+
+def count_findings(findings):
+    get = lambda f, k: getattr(f, k) if hasattr(f, k) else f.get(k)
+    return {s.lower(): len([f for f in findings if get(f, "severity") == s]) for s in ["Critical", "High", "Medium", "Low"]}
+
+def now_utc():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 db = Database()
 analyzer = SecurityAnalyzer()
+try:
+    db.initialize()
+except Exception as exc:
+    print("Falha ao inicializar MySQL:", exc)
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 BASE_STYLE = """
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }}</title>
 <style>
-:root {
-    --bg: #0f172a;
-    --panel: #111827;
-    --panel2: #1f2937;
-    --text: #e5e7eb;
-    --muted: #9ca3af;
-    --border: #374151;
-    --critical: #ef4444;
-    --high: #f97316;
-    --medium: #eab308;
-    --low: #22c55e;
-    --accent: #38bdf8;
-}
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    background: radial-gradient(circle at top, #1e293b 0, #0f172a 45%, #020617 100%);
-    color: var(--text);
-    font-family: Arial, Helvetica, sans-serif;
-}
-
-header {
-    padding: 24px;
-    border-bottom: 1px solid var(--border);
-    background: rgba(15, 23, 42, 0.9);
-    position: sticky;
-    top: 0;
-    z-index: 10;
-}
-
-h1 {
-    margin: 0;
-    font-size: 25px;
-}
-
-a {
-    color: var(--accent);
-    text-decoration: none;
-}
-
-main {
-    max-width: 1450px;
-    margin: 0 auto;
-    padding: 24px;
-}
-
-.nav {
-    display: flex;
-    gap: 14px;
-    margin-top: 10px;
-    font-size: 14px;
-}
-
-.grid {
-    display: grid;
-    grid-template-columns: 1.1fr 0.9fr;
-    gap: 18px;
-}
-
-.card {
-    background: rgba(17, 24, 39, 0.94);
-    border: 1px solid var(--border);
-    border-radius: 18px;
-    overflow: hidden;
-    box-shadow: 0 18px 55px rgba(0, 0, 0, .25);
-}
-
-.card-header {
-    padding: 17px 20px;
-    border-bottom: 1px solid var(--border);
-    background: rgba(31, 41, 55, .76);
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-    align-items: center;
-}
-
-.card-title {
-    font-weight: 800;
-}
-
-.card-body {
-    padding: 20px;
-}
-
-textarea {
-    width: 100%;
-    min-height: 540px;
-    resize: vertical;
-    border-radius: 14px;
-    border: 1px solid var(--border);
-    background: #020617;
-    color: #e5e7eb;
-    padding: 16px;
-    font-family: Consolas, monospace;
-    font-size: 14px;
-    line-height: 1.5;
-    outline: none;
-}
-
-pre {
-    white-space: pre-wrap;
-    word-break: break-word;
-    background: #020617;
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 16px;
-    font-family: Consolas, monospace;
-    font-size: 13px;
-    line-height: 1.5;
-    overflow: auto;
-}
-
-select, button {
-    border-radius: 12px;
-    padding: 11px 13px;
-    outline: none;
-}
-
-select {
-    background: #020617;
-    color: var(--text);
-    border: 1px solid var(--border);
-}
-
-button {
-    border: 0;
-    background: linear-gradient(135deg, #0ea5e9, #2563eb);
-    color: white;
-    cursor: pointer;
-    font-weight: 800;
-}
-
-.danger {
-    background: linear-gradient(135deg, #ef4444, #991b1b);
-}
-
-.form-row {
-    display: flex;
-    gap: 12px;
-    flex-wrap: wrap;
-    align-items: center;
-}
-
-.stats {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 10px;
-}
-
-.stat {
-    background: #020617;
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 14px;
-}
-
-.stat-value {
-    font-size: 25px;
-    font-weight: 900;
-}
-
-.stat-label {
-    color: var(--muted);
-    font-size: 12px;
-    margin-top: 4px;
-}
-
-.finding {
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    margin-bottom: 14px;
-    overflow: hidden;
-    background: #020617;
-}
-
-.finding-top {
-    display: flex;
-    justify-content: space-between;
-    gap: 14px;
-    padding: 14px 16px;
-    border-bottom: 1px solid var(--border);
-    background: rgba(31, 41, 55, .62);
-}
-
-.finding-title {
-    font-weight: 900;
-}
-
-.meta {
-    color: var(--muted);
-    font-size: 12px;
-    margin-top: 5px;
-}
-
-.badge {
-    border-radius: 999px;
-    padding: 6px 10px;
-    font-size: 12px;
-    font-weight: 900;
-    color: #020617;
-    height: fit-content;
-    white-space: nowrap;
-}
-
-.Critical {
-    background: var(--critical);
-}
-
-.High {
-    background: var(--high);
-}
-
-.Medium {
-    background: var(--medium);
-}
-
-.Low {
-    background: var(--low);
-}
-
-.finding-body {
-    padding: 16px;
-    display: grid;
-    gap: 12px;
-}
-
-.block {
-    border-left: 3px solid var(--accent);
-    padding-left: 12px;
-}
-
-.block strong {
-    display: block;
-    margin-bottom: 5px;
-    font-size: 13px;
-}
-
-code {
-    display: block;
-    white-space: pre-wrap;
-    word-break: break-word;
-    background: #111827;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 10px;
-    color: #f8fafc;
-    font-family: Consolas, monospace;
-    font-size: 13px;
-}
-
-table {
-    width: 100%;
-    border-collapse: collapse;
-}
-
-th, td {
-    border-bottom: 1px solid var(--border);
-    padding: 13px;
-    text-align: left;
-    font-size: 14px;
-}
-
-th {
-    color: var(--muted);
-    font-size: 12px;
-    text-transform: uppercase;
-}
-
-.empty {
-    color: var(--muted);
-    text-align: center;
-    padding: 35px 10px;
-}
-
-@media (max-width: 950px) {
-    .grid {
-        grid-template-columns: 1fr;
-    }
-
-    .stats {
-        grid-template-columns: repeat(2, 1fr);
-    }
-}
-</style>
+:root{--bg:#070b16;--bg2:#0d1324;--panel:#11182b;--panel2:#17213a;--txt:#e8eefc;--muted:#97a3b7;--line:#2b3854;--brand:#38bdf8;--brand2:#818cf8;--crit:#fb7185;--high:#fb923c;--med:#facc15;--low:#60a5fa;--ok:#34d399;--shadow:rgba(0,0,0,.34)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif;background:radial-gradient(circle at 10% -10%,rgba(56,189,248,.22),transparent 28%),radial-gradient(circle at 80% 0%,rgba(129,140,248,.18),transparent 30%),linear-gradient(180deg,var(--bg),var(--bg2));color:var(--txt)}
+a{color:var(--brand);text-decoration:none}.sidebar{border-bottom:1px solid var(--line);background:rgba(10,15,30,.86);backdrop-filter:blur(16px);position:sticky;top:0;z-index:20}.side-inner{max-width:1240px;margin:auto;padding:14px 20px;display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap}.logo{display:flex;align-items:center;gap:12px;font-weight:950}.logo-mark{width:38px;height:38px;border-radius:14px;background:linear-gradient(135deg,var(--brand),var(--brand2))}.nav,.toolbar{display:flex;gap:8px;flex-wrap:wrap}.nav a,.btn,button{border:1px solid var(--line);background:rgba(29,41,69,.88);color:var(--txt);border-radius:12px;padding:10px 13px;font-weight:800;cursor:pointer;display:inline-flex;align-items:center;gap:8px}.nav a:hover,.btn:hover,button:hover{border-color:var(--brand)}
+.wrap{max-width:1240px;margin:auto;padding:26px 20px 44px;width:100%}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;flex-wrap:wrap;margin-bottom:18px}h1{margin:0;font-size:clamp(1.8rem,4vw,3.15rem);letter-spacing:-.055em}h2,h3{letter-spacing:-.03em}.muted{color:var(--muted);line-height:1.55}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{grid-column:span 12;background:linear-gradient(180deg,rgba(17,24,43,.98),rgba(23,33,58,.96));border:1px solid var(--line);border-radius:24px;padding:18px;box-shadow:0 24px 70px var(--shadow)}
+@media(min-width:880px){.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}}
+textarea,select,input{width:100%;border:1px solid var(--line);background:#060a14;color:var(--txt);border-radius:16px;padding:13px;outline:none}textarea{min-height:470px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.92rem;line-height:1.55}label{font-weight:900;display:block;margin:0 0 8px}.form-row{display:grid;grid-template-columns:1fr;gap:12px}@media(min-width:780px){.form-row{grid-template-columns:1fr 1fr 1fr}}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.stat{border:1px solid var(--line);border-radius:18px;padding:15px;background:rgba(0,0,0,.18);min-height:96px}.stat b{font-size:2rem}.stat small{color:var(--muted);font-weight:800}.finding{border:1px solid var(--line);border-radius:20px;padding:15px;margin:12px 0;background:rgba(0,0,0,.18)}.finding-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.badge{border-radius:999px;padding:6px 10px;font-weight:950;font-size:.78rem;white-space:nowrap}.Critical{background:rgba(251,113,133,.13);color:var(--crit);border:1px solid rgba(251,113,133,.42)}.High{background:rgba(251,146,60,.12);color:var(--high);border:1px solid rgba(251,146,60,.42)}.Medium{background:rgba(250,204,21,.12);color:var(--med);border:1px solid rgba(250,204,21,.42)}.Low{background:rgba(96,165,250,.12);color:var(--low);border:1px solid rgba(96,165,250,.42)}
+pre,code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}pre{white-space:pre-wrap;overflow:auto;border:1px solid var(--line);border-radius:15px;padding:13px;background:#060a14}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.table th{color:var(--muted);font-size:.85rem;text-transform:uppercase}.alert{border:1px solid rgba(251,113,133,.38);background:rgba(251,113,133,.1);padding:13px;border-radius:16px;margin:12px 0}.success{border:1px solid rgba(52,211,153,.38);background:rgba(52,211,153,.08)}.health-status{display:flex;align-items:center;gap:14px;border:1px solid var(--line);border-radius:20px;padding:18px;background:rgba(0,0,0,.19)}.health-ok{border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.08)}.health-error{border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.08)}.pulse{width:18px;height:18px;border-radius:999px;background:var(--ok);animation:pulse 1.6s infinite}@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.7)}70%{box-shadow:0 0 0 13px transparent}100%{box-shadow:0 0 0 0 transparent}}.big-number{font-size:2.8rem;font-weight:950;color:var(--brand)}.language-list,.check-grid{display:flex;flex-wrap:wrap;gap:10px}.language-pill,.check-item{border:1px solid var(--line);background:rgba(0,0,0,.14);padding:12px;border-radius:16px}.language-pill{color:var(--brand);font-weight:950}.progress{height:10px;border-radius:999px;background:#060a14;border:1px solid var(--line);overflow:hidden}.progress span{display:block;height:100%;background:linear-gradient(90deg,var(--brand),var(--brand2))}.footer{padding:28px;color:var(--muted);text-align:center}
+</style></head><body><header class="sidebar"><div class="side-inner"><div class="logo"><div class="logo-mark"></div><div>{{ app_name }}</div></div><nav class="nav"><a href="{{ url_for('index') }}">Nova análise</a><a href="{{ url_for('dashboard') }}">Dashboard</a><a href="{{ url_for('history') }}">Histórico</a><a href="{{ url_for('health') }}">Health</a></nav></div></header><main class="wrap"><section class="hero"><div><h1>{{ title }}</h1><p class="muted">{{ subtitle }}</p></div></section>{% with messages=get_flashed_messages() %}{% if messages %}{% for message in messages %}<div class="alert success">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}{{ body|safe }}</main><div class="footer">Analyzer educacional local. Use somente em código próprio ou autorizado.</div></body></html>
 """
 
-INDEX_TEMPLATE = """
-<!doctype html>
-<html lang="pt-br">
-<head>
-<meta charset="utf-8">
-<title>OWASP Analyzer</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-""" + BASE_STYLE + """
-</head>
-<body>
-<header>
-    <h1>OWASP Code Analyzer</h1>
-    <div class="nav">
-        <a href="/">Nova análise</a>
-        <a href="/history">Histórico</a>
-    </div>
-</header>
-
-<main>
-    <form method="post" class="grid">
-        <section class="card">
-            <div class="card-header">
-                <div class="card-title">Código-fonte</div>
-                <div class="form-row">
-                    <select name="language">
-                        <option value="php" {% if language == "php" %}selected{% endif %}>PHP</option>
-                        <option value="python" {% if language == "python" %}selected{% endif %}>Python</option>
-                        <option value="java" {% if language == "java" %}selected{% endif %}>Java</option>
-                        <option value="javascript" {% if language == "javascript" %}selected{% endif %}>JavaScript</option>
-                    </select>
-                    <button type="submit">Analisar e salvar</button>
-                </div>
-            </div>
-            <div class="card-body">
-                <textarea name="source_code" spellcheck="false">{{ source_code }}</textarea>
-            </div>
-        </section>
-
-        <section class="card">
-            <div class="card-header">
-                <div class="card-title">Resultado</div>
-                <strong>{{ risk }}</strong>
-            </div>
-            <div class="card-body">
-                <div class="stats">
-                    <div class="stat">
-                        <div class="stat-value">{{ score }}</div>
-                        <div class="stat-label">Score</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value">{{ findings|length }}</div>
-                        <div class="stat-label">Achados</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value">{{ critical_count }}</div>
-                        <div class="stat-label">Críticos</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value">{{ high_count }}</div>
-                        <div class="stat-label">Altos</div>
-                    </div>
-                </div>
-
-                <div style="margin-top:18px">
-                    {% if saved_id %}
-                        <div class="finding">
-                            <div class="finding-body">
-                                <div class="block">
-                                    <strong>Análise salva</strong>
-                                    <div>ID {{ saved_id }} · <a href="/analysis/{{ saved_id }}">abrir detalhes</a></div>
-                                </div>
-                            </div>
-                        </div>
-                    {% endif %}
-
-                    {% if findings %}
-                        {% for f in findings %}
-                            <div class="finding">
-                                <div class="finding-top">
-                                    <div>
-                                        <div class="finding-title">{{ f.title }}</div>
-                                        <div class="meta">Linha {{ f.line }} · {{ f.owasp }} · Confiança {{ f.confidence }}</div>
-                                    </div>
-                                    <div class="badge {{ f.severity }}">{{ f.severity }}</div>
-                                </div>
-                                <div class="finding-body">
-                                    <div class="block">
-                                        <strong>Evidência</strong>
-                                        <code>{{ f.evidence }}</code>
-                                    </div>
-                                    <div class="block">
-                                        <strong>Impacto</strong>
-                                        <div>{{ f.impact }}</div>
-                                    </div>
-                                    <div class="block">
-                                        <strong>Correção recomendada</strong>
-                                        <div>{{ f.recommendation }}</div>
-                                    </div>
-                                </div>
-                            </div>
-                        {% endfor %}
-                    {% else %}
-                        <div class="empty">Nenhum achado relevante identificado.</div>
-                    {% endif %}
-                </div>
-            </div>
-        </section>
-    </form>
-</main>
-</body>
-</html>
+INDEX_BODY = """
+<form method="post"><div class="grid"><section class="card s8"><label for="source_code">Código-fonte</label><textarea id="source_code" name="source_code" spellcheck="false" placeholder="Cole aqui o código para análise...">{{ source_code }}</textarea></section><aside class="card s4"><label for="language">Linguagem</label><select id="language" name="language">{% for item in languages %}<option value="{{ item }}" {% if item == language %}selected{% endif %}>{{ item|upper }}</option>{% endfor %}</select><div class="toolbar"><button type="submit">Analisar e salvar</button><a class="btn" href="{{ url_for('index') }}">Limpar</a><a class="btn" href="{{ url_for('sample') }}">Exemplo</a></div>{% if error %}<div class="alert">{{ error }}</div>{% endif %}<h3>Resumo</h3><div class="stats"><div class="stat"><b>{{ score }}</b><br><small>Score</small></div><div class="stat"><b>{{ findings|length }}</b><br><small>Achados</small></div><div class="stat"><b>{{ critical_count }}</b><br><small>Críticos</small></div><div class="stat"><b>{{ high_count }}</b><br><small>Altos</small></div></div><h3>Risco: {{ risk }}</h3><div class="progress"><span style="width:{{ score }}%"></span></div>{% if saved_id %}<p><a href="{{ url_for('detail', analysis_id=saved_id) }}">Abrir análise salva #{{ saved_id }}</a></p>{% endif %}</aside></div></form>
+<section class="card" style="margin-top:14px"><h2>Resultado</h2>{% if findings %}{% for f in findings %}<div class="finding"><div class="finding-head"><div><strong>{{ f.title }}</strong><p class="muted">Linha {{ f.line }} · {{ f.category }} · {{ f.cwe }} · Confiança {{ f.confidence }}</p></div><span class="badge {{ f.severity }}">{{ f.severity }}</span></div><pre>{{ f.evidence }}</pre><p><strong>OWASP 2021:</strong> {{ f.owasp_2021 }}</p><p><strong>OWASP 2025:</strong> {{ f.owasp_2025 }}</p><p><strong>Impacto:</strong> {{ f.impact }}</p><p><strong>Correção:</strong> {{ f.recommendation }}</p></div>{% endfor %}{% else %}<p class="muted">Nenhum achado relevante identificado.</p>{% endif %}</section>
+"""
+DASHBOARD_BODY = """
+<section class="grid"><article class="card s3"><div class="stat"><b>{{ stats.total_analyses }}</b><br><small>Análises</small></div></article><article class="card s3"><div class="stat"><b>{{ stats.total_findings }}</b><br><small>Achados</small></div></article><article class="card s3"><div class="stat"><b>{{ stats.critical }}</b><br><small>Críticos</small></div></article><article class="card s3"><div class="stat"><b>{{ stats.high }}</b><br><small>Altos</small></div></article></section><section class="grid" style="margin-top:14px"><article class="card s6"><h2>Linguagens analisadas</h2>{% if stats.languages %}<table class="table">{% for row in stats.languages %}<tr><th>{{ row.language|upper }}</th><td>{{ row.total }}</td></tr>{% endfor %}</table>{% else %}<p class="muted">Ainda não existem análises salvas.</p>{% endif %}</article><article class="card s6"><h2>Categorias mais encontradas</h2>{% if stats.categories %}<table class="table">{% for row in stats.categories %}<tr><th>{{ row.category }}</th><td>{{ row.total }}</td></tr>{% endfor %}</table>{% else %}<p class="muted">Ainda não existem achados salvos.</p>{% endif %}</article></section>
+"""
+HISTORY_BODY = """
+<section class="card"><h2>Filtros</h2><form method="get" class="form-row"><div><label>Busca</label><input name="q" value="{{ q }}" placeholder="hash ou trecho de código"></div><div><label>Linguagem</label><select name="language"><option value="">Todas</option>{% for item in languages %}<option value="{{ item }}" {% if item == language %}selected{% endif %}>{{ item|upper }}</option>{% endfor %}</select></div><div><label>Risco</label><select name="risk"><option value="">Todos</option>{% for item in risks %}<option value="{{ item }}" {% if item == risk %}selected{% endif %}>{{ item }}</option>{% endfor %}</select></div><div class="toolbar"><button type="submit">Filtrar</button><a class="btn" href="{{ url_for('history') }}">Limpar filtros</a><a class="btn" href="{{ url_for('clear_history') }}">Limpar histórico</a></div></form></section>
+<section class="card" style="margin-top:14px"><h2>Últimas análises salvas</h2>{% if rows %}<table class="table"><thead><tr><th>ID</th><th>Linguagem</th><th>Risco</th><th>Score</th><th>Achados</th><th>Hash</th><th>Data</th><th>Ações</th></tr></thead><tbody>{% for row in rows %}<tr><td>{{ row.id }}</td><td>{{ row.language }}</td><td>{{ row.risk }}</td><td>{{ row.score }}</td><td>{{ row.total_findings }}</td><td><code>{{ row.source_hash[:12] if row.source_hash else "" }}</code></td><td>{{ row.created_at }}</td><td><a href="{{ url_for('detail', analysis_id=row.id) }}">Abrir</a> · <a href="{{ url_for('delete', analysis_id=row.id) }}">Excluir</a></td></tr>{% endfor %}</tbody></table>{% else %}<p class="muted">Nenhuma análise encontrada.</p>{% endif %}</section>
+"""
+DETAIL_BODY = """
+<section class="grid"><article class="card s8"><h2>Código analisado</h2><p class="muted">{{ analysis.language }} · {{ analysis.created_at }} · hash <code>{{ analysis.source_hash }}</code></p><pre>{{ analysis.source_code }}</pre></article><aside class="card s4"><h2>Resumo</h2><div class="stats"><div class="stat"><b>{{ analysis.score }}</b><br><small>Score</small></div><div class="stat"><b>{{ analysis.total_findings }}</b><br><small>Achados</small></div><div class="stat"><b>{{ critical_count }}</b><br><small>Críticos</small></div><div class="stat"><b>{{ high_count }}</b><br><small>Altos</small></div></div><h3>Risco: {{ analysis.risk }}</h3><div class="progress"><span style="width:{{ analysis.score }}%"></span></div><div class="toolbar"><a class="btn" href="{{ url_for('analysis_json', analysis_id=analysis.id) }}">Ver JSON</a><a class="btn" href="{{ url_for('export_analysis', analysis_id=analysis.id) }}">Exportar</a><a class="btn" href="{{ url_for('reanalyze', analysis_id=analysis.id) }}">Reanalisar</a></div></aside></section><section class="card" style="margin-top:14px"><h2>Achados</h2>{% if findings %}{% for f in findings %}<div class="finding"><div class="finding-head"><div><strong>{{ f.title }}</strong><p class="muted">Linha {{ f.line_number }} · {{ f.category }} · {{ f.cwe }} · Confiança {{ f.confidence }}</p></div><span class="badge {{ f.severity }}">{{ f.severity }}</span></div><pre>{{ f.evidence }}</pre><p><strong>OWASP 2021:</strong> {{ f.owasp_2021 }}</p><p><strong>OWASP 2025:</strong> {{ f.owasp_2025 }}</p><p><strong>Impacto:</strong> {{ f.impact }}</p><p><strong>Correção:</strong> {{ f.recommendation }}</p></div>{% endfor %}{% else %}<p class="muted">Nenhum achado salvo.</p>{% endif %}</section>
+"""
+HEALTH_BODY = """
+<section class="grid"><article class="card s4"><h2>Status da aplicação</h2><div class="health-status health-ok"><div class="pulse"></div><div><strong>Online</strong><p class="muted">Servidor Flask respondendo.</p></div></div></article><article class="card s4"><h2>Status do banco</h2><div class="health-status {{ db_badge }}"><div class="pulse"></div><div><strong>{{ db_status }}</strong><p class="muted">Conexão com MySQL e schema.</p></div></div></article><article class="card s4"><h2>Limite de análise</h2><div class="big-number">{{ max_kb }} KB</div><p class="muted">Tamanho máximo aceito por envio.</p></article></section>
+<section class="grid" style="margin-top:14px"><article class="card s6"><h2>Linguagens suportadas</h2><div class="language-list">{% for language in languages %}<span class="language-pill">{{ language|upper }}</span>{% endfor %}</div><p class="muted">Essas linguagens são reconhecidas pelo motor de análise atual.</p></article><article class="card s6"><h2>Informações técnicas</h2><table class="table"><tr><th>Ambiente</th><td>{{ env }}</td></tr><tr><th>Host</th><td>{{ host }}</td></tr><tr><th>Porta</th><td>{{ port }}</td></tr><tr><th>Banco</th><td>{{ db_name }}</td></tr><tr><th>Horário UTC</th><td>{{ time }}</td></tr><tr><th>Endpoint JSON</th><td><a href="{{ url_for('health_json') }}">/health/json</a></td></tr></table></article></section>
+<section class="card" style="margin-top:14px"><h2>Ações rápidas</h2><div class="toolbar"><a class="btn" href="{{ url_for('index') }}">Sair do Health</a><a class="btn" href="{{ url_for('dashboard') }}">Abrir Dashboard</a><a class="btn" href="{{ url_for('history') }}">Abrir Histórico</a><a class="btn" href="{{ url_for('health_json') }}">Ver JSON</a></div><p class="muted">Use “Sair do Health” para voltar direto para a tela principal, sem depender do botão voltar.</p></section>
+<section class="card" style="margin-top:14px"><h2>Funções monitoradas</h2><div class="check-grid"><div class="check-item"><strong>Análise</strong><p class="muted">Motor regex carregado.</p></div><div class="check-item"><strong>Histórico</strong><p class="muted">Persistência no MySQL.</p></div><div class="check-item"><strong>Dashboard</strong><p class="muted">Resumo por severidade.</p></div><div class="check-item"><strong>API</strong><p class="muted">GET mostra documentação e POST /api/analyze analisa código.</p></div></div></section>
 """
 
-HISTORY_TEMPLATE = """
-<!doctype html>
-<html lang="pt-br">
-<head>
-<meta charset="utf-8">
-<title>Histórico</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-""" + BASE_STYLE + """
-</head>
-<body>
-<header>
-    <h1>Histórico de análises</h1>
-    <div class="nav">
-        <a href="/">Nova análise</a>
-        <a href="/history">Histórico</a>
-    </div>
-</header>
+def page(title, subtitle, body, **context):
+    return render_template_string(BASE_STYLE, app_name=APP_NAME, title=title, subtitle=subtitle, body=render_template_string(body, **context))
 
-<main>
-    <section class="card">
-        <div class="card-header">
-            <div class="card-title">Últimas análises salvas</div>
-        </div>
-        <div class="card-body">
-            {% if rows %}
-                <table>
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>Linguagem</th>
-                            <th>Risco</th>
-                            <th>Score</th>
-                            <th>Achados</th>
-                            <th>Data</th>
-                            <th>Ações</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                    {% for row in rows %}
-                        <tr>
-                            <td>{{ row.id }}</td>
-                            <td>{{ row.language }}</td>
-                            <td>{{ row.risk }}</td>
-                            <td>{{ row.score }}</td>
-                            <td>{{ row.total_findings }}</td>
-                            <td>{{ row.created_at }}</td>
-                            <td>
-                                <a href="/analysis/{{ row.id }}">Abrir</a>
-                                |
-                                <a href="/analysis/{{ row.id }}/delete">Excluir</a>
-                            </td>
-                        </tr>
-                    {% endfor %}
-                    </tbody>
-                </table>
-            {% else %}
-                <div class="empty">Nenhuma análise salva.</div>
-            {% endif %}
-        </div>
-    </section>
-</main>
-</body>
-</html>
-"""
+@app.errorhandler(500)
+def handle_500(error):
+    return page("Erro interno", "Ocorreu uma falha no servidor. Verifique MySQL, usuário, senha e dependências.", """<section class='card'><h2>Internal Server Error</h2><p class='muted'>Abra o terminal onde está rodando python app.py para ver o erro completo.</p><p><a class='btn' href='{{ url_for('health') }}'>Abrir Health Check</a></p></section>"""), 500
 
-DETAIL_TEMPLATE = """
-<!doctype html>
-<html lang="pt-br">
-<head>
-<meta charset="utf-8">
-<title>Detalhes da análise</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-""" + BASE_STYLE + """
-</head>
-<body>
-<header>
-    <h1>Análise #{{ analysis.id }}</h1>
-    <div class="nav">
-        <a href="/">Nova análise</a>
-        <a href="/history">Histórico</a>
-        <a href="/analysis/{{ analysis.id }}/json">JSON</a>
-    </div>
-</header>
+SAMPLE_CODE = '''from flask import Flask, request
+import subprocess
+import hashlib
+app = Flask(__name__)
+@app.route("/user")
+def user():
+    user_id = request.args.get("id")
+    cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
+    return "ok"
+@app.route("/ping")
+def ping():
+    host = request.args.get("host")
+    subprocess.run("echo " + host, shell=True)
+    return "done"
+password_hash = hashlib.md5(b"admin123").hexdigest()
+app.run(debug=True)
+'''
 
-<main>
-    <div class="grid">
-        <section class="card">
-            <div class="card-header">
-                <div class="card-title">Código analisado</div>
-                <strong>{{ analysis.language }}</strong>
-            </div>
-            <div class="card-body">
-                <pre>{{ analysis.source_code }}</pre>
-            </div>
-        </section>
 
-        <section class="card">
-            <div class="card-header">
-                <div class="card-title">Achados</div>
-                <strong>{{ analysis.risk }} · {{ analysis.score }}</strong>
-            </div>
-            <div class="card-body">
-                <div class="stats">
-                    <div class="stat">
-                        <div class="stat-value">{{ analysis.score }}</div>
-                        <div class="stat-label">Score</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value">{{ analysis.total_findings }}</div>
-                        <div class="stat-label">Achados</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value">{{ critical_count }}</div>
-                        <div class="stat-label">Críticos</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value">{{ high_count }}</div>
-                        <div class="stat-label">Altos</div>
-                    </div>
-                </div>
+@app.errorhandler(405)
+def handle_405(error):
+    return redirect(url_for("index"))
 
-                <div style="margin-top:18px">
-                    {% if findings %}
-                        {% for f in findings %}
-                            <div class="finding">
-                                <div class="finding-top">
-                                    <div>
-                                        <div class="finding-title">{{ f.title }}</div>
-                                        <div class="meta">Linha {{ f.line_number }} · {{ f.owasp }} · Confiança {{ f.confidence }}</div>
-                                    </div>
-                                    <div class="badge {{ f.severity }}">{{ f.severity }}</div>
-                                </div>
-                                <div class="finding-body">
-                                    <div class="block">
-                                        <strong>Evidência</strong>
-                                        <code>{{ f.evidence }}</code>
-                                    </div>
-                                    <div class="block">
-                                        <strong>Impacto</strong>
-                                        <div>{{ f.impact }}</div>
-                                    </div>
-                                    <div class="block">
-                                        <strong>Correção recomendada</strong>
-                                        <div>{{ f.recommendation }}</div>
-                                    </div>
-                                </div>
-                            </div>
-                        {% endfor %}
-                    {% else %}
-                        <div class="empty">Nenhum achado salvo.</div>
-                    {% endif %}
-                </div>
-            </div>
-        </section>
-    </div>
-</main>
-</body>
-</html>
-"""
+@app.route("/sample")
+def sample():
+    stats = count_findings([])
+    return page("Nova análise", "Exemplo didático carregado para testar o motor.", INDEX_BODY, source_code=SAMPLE_CODE, language="python", languages=sorted(SUPPORTED_LANGUAGES), findings=[], score=0, risk="Exemplo carregado", saved_id=None, error="", critical_count=stats["critical"], high_count=stats["high"])
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    source_code = ""
-    language = "python"
-    findings = []
-    score = 0
-    risk = "Sem análise"
-    saved_id = None
-
+    source_code, language, findings, score, risk, saved_id, error = "", "python", [], 0, "Sem análise", None, ""
     if request.method == "POST":
         source_code = request.form.get("source_code", "")
-        language = request.form.get("language", "python")
-        findings = analyzer.analyze(source_code, language)
-        score, risk = analyzer.score(findings)
-        saved_id = db.save_analysis(language, source_code, score, risk, findings)
+        language = normalize_language(request.form.get("language", "python"))
+        valid, error = validate_source(source_code)
+        if valid:
+            start = time.perf_counter()
+            findings = analyzer.analyze(source_code, language)
+            score, risk = analyzer.score(findings)
+            saved_id = db.save_analysis(language, source_code, score, risk, findings)
+            flash(f"Análise concluída em {round((time.perf_counter()-start)*1000,2)} ms.")
+    stats = count_findings(findings)
+    return page("Nova análise", "Análise estática educacional para PHP, Python, Java e JavaScript.", INDEX_BODY, source_code=source_code, language=language, languages=sorted(SUPPORTED_LANGUAGES), findings=serialize_findings(findings, True), score=score, risk=risk, saved_id=saved_id, error=error, critical_count=stats["critical"], high_count=stats["high"])
 
-    safe_findings = []
-
-    for f in findings:
-        item = asdict(f)
-        item["evidence"] = html.escape(item["evidence"])
-        safe_findings.append(item)
-
-    critical_count = len([f for f in findings if f.severity == "Critical"])
-    high_count = len([f for f in findings if f.severity == "High"])
-
-    return render_template_string(
-        INDEX_TEMPLATE,
-        source_code=source_code,
-        language=language,
-        findings=safe_findings,
-        score=score,
-        risk=risk,
-        saved_id=saved_id,
-        critical_count=critical_count,
-        high_count=high_count
-    )
+@app.route("/dashboard")
+def dashboard():
+    try: stats = db.stats()
+    except Exception: stats = {"total_analyses":0,"total_findings":0,"critical":0,"high":0,"medium":0,"low":0,"languages":[],"categories":[]}
+    return page("Dashboard", "Visão geral das análises salvas, severidades e categorias.", DASHBOARD_BODY, stats=stats)
 
 @app.route("/history")
 def history():
-    rows = db.get_history()
-
-    return render_template_string(
-        HISTORY_TEMPLATE,
-        rows=rows
-    )
+    q = request.args.get("q", "").strip()
+    language = normalize_language(request.args.get("language", "")) if request.args.get("language") else ""
+    risk = request.args.get("risk", "").strip()
+    rows = db.get_history(q=q, language=language, risk=risk)
+    return page("Histórico", "Consulta das análises armazenadas no MySQL.", HISTORY_BODY, rows=rows, q=q, language=language, risk=risk, languages=sorted(SUPPORTED_LANGUAGES), risks=["Crítico", "Alto", "Médio", "Baixo", "Sem achados relevantes"])
 
 @app.route("/analysis/<int:analysis_id>")
 def detail(analysis_id):
     analysis, findings = db.get_analysis(analysis_id)
-
     if not analysis:
-        return redirect(url_for("history"))
+        flash("Análise não encontrada."); return redirect(url_for("history"))
+    stats = count_findings(findings)
+    return page(f"Análise #{analysis_id}", "Detalhes do código analisado e dos achados.", DETAIL_BODY, analysis=analysis, findings=findings, critical_count=stats["critical"], high_count=stats["high"])
 
-    critical_count = len([f for f in findings if f["severity"] == "Critical"])
-    high_count = len([f for f in findings if f["severity"] == "High"])
-
-    return render_template_string(
-        DETAIL_TEMPLATE,
-        analysis=analysis,
-        findings=findings,
-        critical_count=critical_count,
-        high_count=high_count
-    )
-
-@app.route("/analysis/<int:analysis_id>/delete")
+@app.route("/analysis/<int:analysis_id>/delete", methods=["GET", "POST"])
 def delete(analysis_id):
-    db.delete_analysis(analysis_id)
-    return redirect(url_for("history"))
+    db.delete_analysis(analysis_id); flash(f"Análise #{analysis_id} excluída."); return redirect(url_for("history"))
 
 @app.route("/analysis/<int:analysis_id>/json")
 def analysis_json(analysis_id):
     analysis, findings = db.get_analysis(analysis_id)
+    if not analysis: return jsonify({"error":"Analysis not found"}), 404
+    return jsonify({"analysis": analysis, "findings": findings})
 
-    if not analysis:
-        return jsonify({"error": "Analysis not found"}), 404
+@app.route("/analysis/<int:analysis_id>/export")
+def export_analysis(analysis_id):
+    analysis, findings = db.get_analysis(analysis_id)
+    if not analysis: return jsonify({"error":"Analysis not found"}), 404
+    payload = {"exported_at": now_utc(), "app": APP_NAME, "analysis": analysis, "findings": findings}
+    response = make_response(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    response.headers["Content-Type"] = "application/json; charset=utf-8"
+    response.headers["Content-Disposition"] = f"attachment; filename=owasp-analysis-{analysis_id}.json"
+    return response
 
-    return jsonify({
-        "analysis": analysis,
-        "findings": findings
-    })
-
-@app.route("/api/analyze", methods=["POST"])
-def api_analyze():
-    data = request.get_json(silent=True) or {}
-    source_code = data.get("source_code", "")
-    language = data.get("language", "python")
-    save = bool(data.get("save", True))
-
+@app.route("/analysis/<int:analysis_id>/reanalyze")
+def reanalyze(analysis_id):
+    source = db.get_recent_source(analysis_id)
+    if not source:
+        flash("Análise não encontrada."); return redirect(url_for("history"))
+    language, source_code = source
     findings = analyzer.analyze(source_code, language)
     score, risk = analyzer.score(findings)
-    analysis_id = None
+    new_id = db.save_analysis(language, source_code, score, risk, findings)
+    flash(f"Análise #{analysis_id} reanalisada e salva como #{new_id}.")
+    return redirect(url_for("detail", analysis_id=new_id))
 
-    if save:
-        analysis_id = db.save_analysis(language, source_code, score, risk, findings)
+@app.route("/history/clear", methods=["GET", "POST"])
+def clear_history():
+    if request.args.get("confirm") != "yes":
+        return page("Confirmar limpeza", "Esta ação remove todo o histórico salvo.", """<section class='card'><h2>Limpar histórico?</h2><p class='muted'>Remove análises e achados salvos. O banco continua existindo.</p><div class='toolbar'><a class='btn' href='{{ url_for('clear_history', confirm='yes') }}'>Confirmar limpeza</a><a class='btn' href='{{ url_for('history') }}'>Cancelar</a></div></section>""")
+    db.clear_history(); flash("Histórico limpo com sucesso."); return redirect(url_for("history"))
 
-    return jsonify({
-        "analysis_id": analysis_id,
-        "language": language,
-        "score": score,
-        "risk": risk,
-        "total_findings": len(findings),
-        "findings": [asdict(f) for f in findings]
-    })
+@app.route("/api/analyze", methods=["GET", "POST"])
+def api_analyze():
+    if request.method == "GET":
+        return redirect(url_for("index"))
+
+    data = request.get_json(silent=True) or {}
+    source_code = data.get("source_code", "")
+    language = normalize_language(data.get("language", "python"))
+    save = bool(data.get("save", True))
+
+    valid, error = validate_source(source_code)
+
+    if not valid:
+        return jsonify({"error": error}), 400
+
+    start = time.perf_counter()
+    findings = analyzer.analyze(source_code, language)
+    score, risk = analyzer.score(findings)
+    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    analysis_id = db.save_analysis(language, source_code, score, risk, findings) if save else None
+
+    return jsonify(
+        {
+            "analysis_id": analysis_id,
+            "language": language,
+            "score": score,
+            "risk": risk,
+            "total_findings": len(findings),
+            "elapsed_ms": elapsed_ms,
+            "findings": serialize_findings(findings),
+        }
+    )
+
+
+@app.route("/health")
+def health():
+    db_ok, db_status = db.ping()
+    return page("Health Check", "Diagnóstico visual da aplicação, banco e configuração.", HEALTH_BODY, db_status=db_status, db_badge="health-ok" if db_ok else "health-error", max_kb=round(MAX_SOURCE_SIZE/1024,1), languages=sorted(SUPPORTED_LANGUAGES), env=os.getenv("FLASK_ENV", "development"), host=os.getenv("HOST", "127.0.0.1"), port=os.getenv("PORT", "5000"), db_name=DB_NAME, time=now_utc())
+
+@app.route("/health/json")
+def health_json():
+    db_ok, db_status = db.ping()
+    return jsonify({"status":"ok", "database_ok": db_ok, "database": db_status, "database_name": DB_NAME, "supported_languages": sorted(SUPPORTED_LANGUAGES), "max_source_size": MAX_SOURCE_SIZE, "time": now_utc()})
+
+def open_browser_once(host: str, port: int) -> None:
+    if os.getenv("AUTO_OPEN_BROWSER", "1") == "1":
+        url_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+        threading.Timer(1.2, lambda: webbrowser.open(f"http://{url_host}:{port}")).start()
+
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+
+    open_browser_once(host, port)
+
+    app.run(
+        host=host,
+        port=port,
+        debug=debug,
+        use_reloader=False,
+    )
